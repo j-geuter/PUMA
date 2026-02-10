@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-gpu=16
 #SBATCH --mem=360GB
-#SBATCH --time=3-00:00:00=
+#SBATCH --time=3-00:00:00
 
 conda deactivate
 conda activate your-conda-env-here
