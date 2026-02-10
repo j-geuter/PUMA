@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/title.svg" alt="PUMA title" width="100%">
+  <img src="figure/title.svg" alt="PUMA title" width="100%">
 </p>
 
 ---
