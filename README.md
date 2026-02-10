@@ -1,11 +1,16 @@
-# PUMA
+<div align="center">
 
-**Progressive Unmasking for Accelerated Masked Diffusion Training**
+# PUMA: Progressive Unmasking for Accelerated Masked Diffusion Training
 
-*Stop Training for the Worst: Progressive Unmasking Accelerates Masked Diffusion Training*
+The codebase for paper *Stop Training for the Worst: Progressive Unmasking Accelerates Masked Diffusion Training*
+
+</div>
+
+<div align="center">
+  <img src="figure/main_fig.png" width="85%" alt="PUMA overview">
+</div>
 
 ---
-[PUMA overview](figure/main_fig.pdf)
 
 ## Overview
 
