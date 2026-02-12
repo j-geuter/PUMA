@@ -15,6 +15,7 @@ training:
   mode: "confidence_collapse"
   confidence_threshold: 0.9
   eos_id: 151643
+  interval_change: false
   K: 5
   block_size: 256
   k_schedule:
@@ -31,6 +32,7 @@ training:
     - [35, 300000]
     - [38, 330000]
     - [41, 360000]
+  reweighting: "none"
   data_ratio: 1.0
   learning_rate: 3e-4
   weight_decay: 0.01
