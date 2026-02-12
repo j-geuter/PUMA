@@ -7,10 +7,10 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-gpu=16
 #SBATCH --mem=360GB
-#SBATCH --time=3-00:00:00=
+#SBATCH --time=3-00:00:00
 
 conda deactivate
-conda activate your-conda-env-here
+conda activate puma
 module load cuda # if needed
 
 MASTER_HOST=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)

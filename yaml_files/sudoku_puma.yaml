@@ -11,6 +11,7 @@ model:
 
 training:
   strategy: "progressive"
+  reweighting: "none"
   confidence_threshold: 0.9
   mode: "standard" # [standard, x0, mixed]
   K: 8
