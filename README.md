@@ -1,6 +1,6 @@
 <div align="center">
 
-# PUMA: Progressive Unmasking for Accelerated Masked Diffusion Training
+# <span style="color:#E85D04;">P</span><span style="color:#F48C06;">U</span><span style="color:#2A9D8F;">M</span><span style="color:#3A86FF;">A</span>: <span style="color:#E85D04;">P</span>rogressive <span style="color:#F48C06;">U</span>nmasking for <span style="color:#2A9D8F;">A</span>ccelerated <span style="color:#3A86FF;">M</span>asked Diffusion Training
 
 </div>
 
@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="figure/main_fig.png" alt="PUMA Main Figure" width="850">
+  <img src="figure/main_fig.png" alt="PUMA Main Figure" width="700">
 </p>
 
 ---
