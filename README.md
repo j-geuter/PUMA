@@ -4,6 +4,19 @@
 
 </div>
 
+<p align="center">
+  <a href="https://arxiv.org/abs/2602.10314">
+    <img
+      src="https://img.shields.io/badge/Paper-Arxiv-red?logo=arxiv&logoColor=red"
+      alt="PUMA Paper on arXiv"
+    />
+  </a>
+</p>
+
+<p align="center">
+  <img src="figure/main_fig.png" alt="PUMA Main Figure" width="850">
+</p>
+
 ---
 
 ## Overview
