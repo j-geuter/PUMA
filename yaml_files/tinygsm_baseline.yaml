@@ -26,6 +26,9 @@ training:
   eval_steps: 5000
   save_steps: 20000
   ema: 0.9999 # same as MDLM. Leave empty to disable EMA
+  papl_reweigh: false
+  papl_alpha: 1.0
+  papl_tau: 1.0
 
 validation:
   val_dir: "none" # gsm8k eval loop is self-included
@@ -37,7 +40,7 @@ validation:
 data:
   mask_id: 151644
   dataset: "tinygsm"
-  data_dir: "data/tiny_gsm"
+  data_dir: "/n/netscratch/sham_lab/Everyone/jay_jonathan/tiny_gsm"
   val_ratio: 0.02
   seed: 2026
   training:
@@ -47,5 +50,5 @@ data:
 wandb:
   wandb: true
   project: "mdm-pretraining"
-  name: "puma"
-  entity: "your-entity-here"
+  name: "tinygsm-baseline"
+  entity: "jaeyeon_kim-harvard-university"

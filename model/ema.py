@@ -4,6 +4,7 @@
 
 import torch
 import os
+import time
 from torch.nn.parallel import DistributedDataParallel as DDP
 from omegaconf import OmegaConf
 
@@ -31,8 +32,16 @@ def save_model_snapshot(
 
     path = os.path.join(ckpt_dir, f"step={global_step}.pt")
     tmp_path = path + ".tmp"
-    torch.save(checkpoint, tmp_path)
-    os.replace(tmp_path, path)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    for attempt in range(3):
+        try:
+            torch.save(checkpoint, tmp_path)
+            os.replace(tmp_path, path)
+            break
+        except OSError:
+            if attempt == 2:
+                raise
+            time.sleep(2)
     return path
 
 def save_ema_snapshot(
@@ -67,8 +76,16 @@ def save_ema_snapshot(
     # atomic-ish save (tmp -> rename)
     path = os.path.join(ckpt_dir, f"ema_step={global_step}.pt")
     tmp_path = path + ".tmp"
-    torch.save(checkpoint, tmp_path)
-    os.replace(tmp_path, path)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    for attempt in range(3):
+        try:
+            torch.save(checkpoint, tmp_path)
+            os.replace(tmp_path, path)
+            break
+        except OSError:
+            if attempt == 2:
+                raise
+            time.sleep(2)
 
     # restore original (non-EMA) weights
     ema.restore(model_to_save.parameters())

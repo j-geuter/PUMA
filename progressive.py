@@ -1,13 +1,14 @@
 from typing import List, Tuple, Optional
 from torch.utils.data import DataLoader
 import torch
+import torch.nn.functional as F
 import math
 
 # -----------------------------------------
 # helper function
 # -----------------------------------------
 
-def mdm_loss_fn(log_probs: torch.Tensor, x0: torch.Tensor, xt: torch.Tensor, mask_id: int, prompt_mask: torch.Tensor, arm_init: bool = False) -> torch.Tensor:
+def mdm_loss_fn(log_probs: torch.Tensor, x0: torch.Tensor, xt: torch.Tensor, mask_id: int, prompt_mask: torch.Tensor, arm_init: bool = False, papl_alpha: Optional[float] = None, papl_tau: float = 1.0) -> torch.Tensor:
     """
     compute the MDM (reweighted) loss with the given probs 
     the progessive masking strategy requires log probs, so we cannot use the CE loss directly
@@ -30,7 +31,16 @@ def mdm_loss_fn(log_probs: torch.Tensor, x0: torch.Tensor, xt: torch.Tensor, mas
     
     # compute the likelihood w.r.t. the true positions
     nll = -log_probs.gather(dim = -1, index = x0.unsqueeze(-1)).squeeze(-1)
-    per_seq_loss = (nll * masked).sum(dim = 1, keepdim=True)
+
+    if papl_alpha is not None:
+        target_log_probs = (-nll).detach()
+        detached_scores = (target_log_probs / papl_tau).masked_fill(~masked, float("-inf"))
+        planner_weights = F.softmax(detached_scores, dim=-1)
+        planner_weights = torch.where(masked, planner_weights, torch.zeros_like(planner_weights))
+        papl_token_weights = 1.0 + papl_alpha * planner_weights
+        per_seq_loss = (nll * masked * papl_token_weights).sum(dim=1, keepdim=True)
+    else:
+        per_seq_loss = (nll * masked).sum(dim = 1, keepdim=True)
 
     # calculate the weights per seq
     return (per_seq_loss / num_mask).sum() / B

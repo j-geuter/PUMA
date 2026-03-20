@@ -38,7 +38,7 @@ validation:
 data:
   mask_id: 151644
   dataset: "tinygsm"
-  data_dir: "data/tiny_gsm"
+  data_dir: "/n/netscratch/sham_lab/Everyone/jay_jonathan/tiny_gsm"
   val_ratio: 0.02
   seed: 2026
   training:
@@ -48,5 +48,5 @@ data:
 wandb:
   wandb: true
   project: "mdm-pretraining"
-  name: "puma"
-  entity: "your-entity-here"
+  name: "tinygsm-block-baseline"
+  entity: "jaeyeon_kim-harvard-university"

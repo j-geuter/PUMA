@@ -1,4 +1,4 @@
-import math, os, time, json, random, sys, datetime
+import math, os, time, json, random, sys, datetime, random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -26,6 +26,7 @@ from eval.gsm8k_eval import evaluate_ddp_gsm8k
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cfg", type=str)
+    parser.add_argument("--seed", type=int, default=None, help="Optional fixed seed (overrides random)")
     return parser.parse_args()
 
 
@@ -71,7 +72,7 @@ def evaluate_ddp(model, cfg, device, rank: int, world_size: int, sampling):
         raise ValueError(f"Invalid dataset: {cfg.data.dataset}")
 
 # mdm loss implementation
-def mdm_loss(model, input_ids, mask_id: int, prompt_mask: Optional[torch.Tensor] = None, arm_init: bool = False):
+def mdm_loss(model, input_ids, mask_id: int, prompt_mask: Optional[torch.Tensor] = None, arm_init: bool = False, papl_alpha: Optional[float] = None, papl_tau: float = 1.0):
     # sample integer uniformly for each batch from [1,L]
     # prompt_mask (boolean mask): 1 for prompt
     if prompt_mask is None:
@@ -92,11 +93,21 @@ def mdm_loss(model, input_ids, mask_id: int, prompt_mask: Optional[torch.Tensor]
     # calculate (reweighted) loss
     num_mask = num_mask.float().expand_as(mask_indices)
 
-    if arm_init:
+    if papl_alpha is not None:
+        log_probs = F.log_softmax(logits, dim=-1)
+        nll = -log_probs.gather(-1, input_ids.unsqueeze(-1)).squeeze(-1)
+        target_log_probs = (-nll).detach()
+        detached_scores = (target_log_probs / papl_tau).masked_fill(~mask_indices, float("-inf"))
+        planner_weights = F.softmax(detached_scores, dim=-1)
+        planner_weights = torch.where(mask_indices, planner_weights, torch.zeros_like(planner_weights))
+        papl_token_weights = 1.0 + papl_alpha * planner_weights
+        loss = papl_token_weights[mask_indices] * nll[mask_indices] / num_mask[mask_indices]
+    elif arm_init:
         ce = F.cross_entropy(logits[:, :-1, :][mask_indices[:, 1:]], input_ids[:, 1:][mask_indices[:, 1:]], reduction="none")
+        loss = ce / num_mask[mask_indices[:, 1:]]
     else:
         ce = F.cross_entropy(logits[mask_indices], input_ids[mask_indices], reduction="none")
-    loss = ce / num_mask[mask_indices]
+        loss = ce / num_mask[mask_indices]
     return loss.sum() / B
 
 def arm_loss(
@@ -134,7 +145,7 @@ def arm_loss(
     return F.cross_entropy(pred_logits[valid], targets[valid], reduction="mean")
 
 # validation loss helper
-def val_loss_ddp(model, val_loader, mask_id: int, device, rank: int, world_size: int, strategy: str, eos_id: int, arm_init: bool = False):
+def val_loss_ddp(model, val_loader, mask_id: int, device, rank: int, world_size: int, strategy: str, eos_id: int, arm_init: bool = False, papl_alpha: Optional[float] = None, papl_tau: float = 1.0):
     model.eval()
     if world_size > 1 and dist.is_initialized() and not isinstance(val_loader.sampler, DistributedSampler):
         sampler = DistributedSampler(val_loader.dataset, num_replicas=world_size, rank=rank, shuffle=False)
@@ -151,30 +162,62 @@ def val_loss_ddp(model, val_loader, mask_id: int, device, rank: int, world_size:
 
     local_sum = 0.0
     local_count = 0
+    local_sum_papl = 0.0
 
     with torch.no_grad():
         for batch in tqdm(val_loader, desc = "Validating", disable = (rank != 0)):
             x0 = batch["labels"].to(device)
-            pm = batch["prompt_mask"].to(device) if "prompt_mask" in batch else None
-            
-            # to enable flashattention, we do autocast
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled = torch.cuda.is_available()):
-                if strategy == "arm":
-                    loss = arm_loss(model, x0, eos_id=eos_id, prompt_mask=pm)
-                elif strategy in ["progressive", "standard"]:
-                    loss = mdm_loss(model, x0, mask_id, prompt_mask = pm, arm_init=arm_init)
-                else:
-                    raise ValueError(f"Unknown strategy: {strategy}")
+            pm = batch["prompt_mask"].to(device) if "prompt_mask" in batch else torch.zeros_like(x0, dtype=torch.bool)
             B = x0.shape[0]
-            local_sum += float(loss.item() * B)
+
+            if strategy == "arm":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+                    loss = arm_loss(model, x0, eos_id=eos_id, prompt_mask=pm)
+                local_sum += float(loss.item() * B)
+            elif strategy in ["progressive", "standard"]:
+                # inline masking so both losses share one forward pass
+                L = x0.shape[1]
+                L_eff = L - pm.sum(dim=1, keepdim=True)
+                num_mask = torch.floor(torch.rand(B, 1, device=device) * L_eff.clamp(min=1)).long() + 1
+                scores = torch.rand((B, L), device=device).masked_fill(pm, float('inf')).argsort(dim=1)
+                mask_indices = scores.argsort(dim=1) < num_mask
+                masked_input = torch.where(mask_indices, mask_id, x0)
+                num_mask_exp = num_mask.float().expand_as(mask_indices)
+
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+                    logits = model(masked_input)
+
+                if arm_init:
+                    ce = F.cross_entropy(logits[:, :-1, :][mask_indices[:, 1:]], x0[:, 1:][mask_indices[:, 1:]], reduction="none")
+                    loss = (ce / num_mask_exp[mask_indices[:, 1:]]).sum() / B
+                else:
+                    ce = F.cross_entropy(logits[mask_indices], x0[mask_indices], reduction="none")
+                    loss = (ce / num_mask_exp[mask_indices]).sum() / B
+                local_sum += float(loss.item() * B)
+
+                if papl_alpha is not None:
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    nll = -log_probs.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
+                    target_log_probs = (-nll).detach()
+                    detached_scores = (target_log_probs / papl_tau).masked_fill(~mask_indices, float("-inf"))
+                    planner_weights = F.softmax(detached_scores, dim=-1)
+                    planner_weights = torch.where(mask_indices, planner_weights, torch.zeros_like(planner_weights))
+                    papl_token_weights = 1.0 + papl_alpha * planner_weights
+                    papl_loss = (papl_token_weights[mask_indices] * nll[mask_indices] / num_mask_exp[mask_indices]).sum() / B
+                    local_sum_papl += float(papl_loss.item() * B)
+            else:
+                raise ValueError(f"Unknown strategy: {strategy}")
+
             local_count += B
-    
-    tensor = torch.tensor([local_sum, local_count], dtype=torch.float, device=device)
+
+    tensor = torch.tensor([local_sum, local_count, local_sum_papl], dtype=torch.float, device=device)
     if world_size > 1 and dist.is_initialized():
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    global_sum, global_count = tensor.tolist()
+    global_sum, global_count, global_sum_papl = tensor.tolist()
 
-    return global_sum / max(int(global_count), 1)
+    val_loss = global_sum / max(int(global_count), 1)
+    val_loss_reweigh = (global_sum_papl / max(int(global_count), 1)) if papl_alpha is not None else None
+    return val_loss, val_loss_reweigh
 
 def parse_k_schedule_increasing(k_schedule) -> List[Tuple[int, int]]:
     """
@@ -212,15 +255,15 @@ def parse_k_schedule_increasing(k_schedule) -> List[Tuple[int, int]]:
 
 
 
-def main(cfg: DictConfig):
+def main(cfg: DictConfig, args):
     # setup the DDP
     rank, world_size, local_rank = setup_ddp()
     is_main = (rank == 0)
     if is_main:
         print("Hey, we start training!")
         print(f"Training with {world_size} GPUs")
-    
-    base_seed = 2026
+
+    base_seed = args.seed if args.seed is not None else random.randint(0, int(1e8))
     seed = base_seed + rank
     torch.manual_seed(seed)
     random.seed(seed)
@@ -228,7 +271,7 @@ def main(cfg: DictConfig):
     torch.cuda.manual_seed(seed)
 
     # ckpt dir
-    ckpt_dir = f"ckpts/date={datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
+    ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"ckpts/date={datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}")
     os.makedirs(ckpt_dir, exist_ok=True)
     if is_main:
         print(f"Checkpoints will be saved to: {ckpt_dir}")
@@ -269,6 +312,10 @@ def main(cfg: DictConfig):
     data_cfg = cfg.data
     train_cfg = cfg.training
     assert train_cfg.save_steps % train_cfg.eval_steps == 0, "save_steps must be divisible by eval_steps"
+
+    papl_reweigh = getattr(train_cfg, 'papl_reweigh', False)
+    papl_alpha = float(getattr(train_cfg, 'papl_alpha', 1.0)) if papl_reweigh else None
+    papl_tau = float(getattr(train_cfg, 'papl_tau', 1.0))
     val_cfg = cfg.validation
     data_bundle = setup_data_bundle(data_cfg)
     train_loader, val_loader = data_bundle.train_loader, data_bundle.val_loader    
@@ -344,7 +391,10 @@ def main(cfg: DictConfig):
         
     # wandb initialize
     if cfg.wandb.wandb and is_main:
-        wandb.init(project=cfg.wandb.project, name=cfg.wandb.name, entity=cfg.wandb.entity)
+        run_name = cfg.wandb.name
+        if args.seed is not None:
+            run_name = f"{run_name}_seed{args.seed}"
+        wandb.init(project=cfg.wandb.project, name=run_name, entity=cfg.wandb.entity)
 
     for epoch in range(train_cfg.num_epochs):
         model.train()
@@ -381,12 +431,12 @@ def main(cfg: DictConfig):
                     xt = pool.current_batch()
                     logits = model(xt)
                     log_probs = F.log_softmax(logits, dim=-1)
-                    loss = mdm_loss_fn(log_probs, pool.x0, pool.xt, mask_id, prompt_mask = pool.state['prompt_mask'], arm_init=model_config.predict_next_token)
+                    loss = mdm_loss_fn(log_probs, pool.x0, pool.xt, mask_id, prompt_mask=pool.state['prompt_mask'], arm_init=model_config.predict_next_token, papl_alpha=papl_alpha, papl_tau=papl_tau)
                 elif strategy == "standard":
                     batch = itr
                     input_ids = batch["labels"].to(device)
                     prompt_mask = batch["prompt_mask"].to(device) if "prompt_mask" in batch else None
-                    loss = mdm_loss(model, input_ids, mask_id, prompt_mask = prompt_mask, arm_init=model_config.predict_next_token)
+                    loss = mdm_loss(model, input_ids, mask_id, prompt_mask=prompt_mask, arm_init=model_config.predict_next_token, papl_alpha=papl_alpha, papl_tau=papl_tau)
                 elif strategy == "arm":
                     batch = itr
                     input_ids = batch["labels"].to(device)
@@ -434,7 +484,7 @@ def main(cfg: DictConfig):
                     val_acc_dict = None
 
                 # validation loss (mdm loss on the validation dataset)
-                val_loss = val_loss_ddp(model, val_loader, mask_id, device, rank, world_size, strategy, eos_id, arm_init=model_config.predict_next_token)
+                val_loss, val_loss_reweigh = val_loss_ddp(model, val_loader, mask_id, device, rank, world_size, strategy, eos_id, arm_init=model_config.predict_next_token, papl_alpha=papl_alpha, papl_tau=papl_tau)
 
                 # EMA evaluation
                 if train_cfg.ema is not None:
@@ -462,6 +512,8 @@ def main(cfg: DictConfig):
                     print(f"Epoch {epoch+1}, Step {global_step}, Validation Loss: {val_loss}")
                     if cfg.wandb.wandb:
                         wandb.log({"val_loss": val_loss}, step=global_step)
+                        if val_loss_reweigh is not None:
+                            wandb.log({"val_loss_reweigh": val_loss_reweigh}, step=global_step)
 
                     if is_main and global_step % train_cfg.save_steps == 0 and train_cfg.ema is not None:
                         saved_path = save_ema_snapshot(ckpt_dir, model, ema, cfg, epoch, global_step, val_loss, val_acc_dict)
@@ -491,4 +543,4 @@ if __name__ == "__main__":
     args = parse_args()
     cfg_path = args.cfg
     cfg = OmegaConf.load(cfg_path)
-    main(cfg)
+    main(cfg, args)

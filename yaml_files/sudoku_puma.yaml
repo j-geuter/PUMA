@@ -19,16 +19,19 @@ training:
   weight_decay: 0.01
   num_epochs: 2
   max_grad_norm: 1.0
-  batch_size: 32
+  batch_size: 64
   warmup_steps: 1000
   logging_steps: 100
   eval_steps: 2000
   save_steps: 10000
   ema: 0.9999
   eos_id: null
+  papl_reweigh: false
+  papl_alpha: 1.0
+  papl_tau: 1.0
 
 validation:
-  val_dir: "data/sudoku_new"
+  val_dir: "../data/sudoku_new"
   ratio: 0.01
   sampling: 
     temperature: 0.0
@@ -38,7 +41,7 @@ validation:
 data:
   mask_id: 10
   dataset: "sudoku"
-  data_dir: "data/sudoku_new"
+  data_dir: "../data/sudoku_new"
   sudoku_type: "new"
   val_ratio: 0.05
   seed: 2026
@@ -51,4 +54,4 @@ wandb:
   wandb: true
   project: "mdm-pretraining"
   name: "sudoku-puma"
-  entity: "your-entity-here"
+  entity: "jaeyeon_kim-harvard-university"
