@@ -106,7 +106,7 @@ def main(cfg: DictConfig):
     torch.cuda.manual_seed(seed)
 
     # ckpt dir
-    ckpt_dir = f"ckpts/date={datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
+    ckpt_dir = f"/n/netscratch/dam_lab/Lab/jgeuter/MDMPre/ckpts/date={datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
     os.makedirs(ckpt_dir, exist_ok=True)
     if is_main:
         print(f"Checkpoints will be saved to: {ckpt_dir}")

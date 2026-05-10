@@ -3,4 +3,4 @@ __pycache__/
 yaml_files/*
 scripts/*
 ckpts/*
-
+results/*

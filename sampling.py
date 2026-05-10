@@ -97,7 +97,7 @@ def arm_sampling(model, xt, mask_id, sampling_cfg, device: torch.device = None, 
     return (xt, track_xt) if track else xt
 
 @torch.no_grad()
-def mdm_sampling(model, xt, mask_id, sampling_cfg, device: torch.device = None, track: bool = False, arm_init: bool = False):
+def mdm_sampling(model, xt, mask_id, sampling_cfg, device: torch.device = None, track: bool = False, arm_init: bool = False, return_stats: bool = False):
     # sampling hyperparameters
     # xt can include clean tokens
     # if track == True, we return the trace (used for the debugging purpose)
@@ -105,11 +105,19 @@ def mdm_sampling(model, xt, mask_id, sampling_cfg, device: torch.device = None, 
     confidence = sampling_cfg.confidence
     unmasking_num = sampling_cfg.unmasking_num
 
+    confidence_collapse = getattr(sampling_cfg, 'confidence_collapse', False)
+    confidence_threshold = getattr(sampling_cfg, 'confidence_threshold', 0.9)
+    sample_then_pick = getattr(sampling_cfg, 'sample_then_pick', False)
+
     # shape
     B, L = xt.shape
     xt = xt.clone()
     if track:
         track_xt = []
+
+    if return_stats:
+        _stat_tokens = 0       # total tokens unmasked across all steps and samples
+        _stat_active_steps = 0  # total (sample, step) pairs where sample still had masks
 
     if arm_init:
         xt_t1, xt = xt[:, :1], xt[:, 1:]
@@ -121,6 +129,10 @@ def mdm_sampling(model, xt, mask_id, sampling_cfg, device: torch.device = None, 
 
         if mask_indices.sum() == 0:
             break
+
+        if return_stats:
+            active = mask_indices.any(dim=1)  # (B,) which samples still have masks
+            _stat_active_steps += int(active.sum().item())
 
         # calculate logits
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled = torch.cuda.is_available()):
@@ -142,19 +154,53 @@ def mdm_sampling(model, xt, mask_id, sampling_cfg, device: torch.device = None, 
             raise NotImplementedError("Random confidence sampling strategy yet to be implemented")
         else:
             raise NotImplementedError(f"Confidence sampling strategy '{confidence}' not supported")
-        
-        # update masked tokens by selecting top-k per batch this step
-        for j in range(B):
-            k = min(unmasking_num, int(mask_indices[j].sum().item())) # number of tokens to unmask
-            if k > 0:
-                _, select_indices = torch.topk(unmasking_score[j], k=k)
-                xt[j, select_indices] = torch.argmax(logits_with_noise[j, select_indices], dim = -1)
-            
+
+        # update masked tokens
+        if confidence_collapse:
+            high_conf = (p.max(dim=-1).values > confidence_threshold) & mask_indices
+            if high_conf.any():
+                for j in range(B):
+                    sel = high_conf[j].nonzero(as_tuple=False).squeeze(1)
+                    if sel.numel() > 0:
+                        xt[j, sel] = torch.argmax(logits_with_noise[j, sel], dim=-1)
+            else:
+                # fallback: top-2
+                for j in range(B):
+                    k = min(2, int(mask_indices[j].sum().item()))
+                    if k > 0:
+                        _, sel = torch.topk(unmasking_score[j], k=k)
+                        xt[j, sel] = torch.argmax(logits_with_noise[j, sel], dim=-1)
+        elif sample_then_pick:
+            # sample a token at every masked position simultaneously (Gumbel at temperature T),
+            # then keep the top-K positions ranked by their probability under softmax(logits)
+            sampled = torch.argmax(logits_with_noise, dim=-1)  # (B, L)
+            sampled_prob = p.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)  # (B, L)
+            score = torch.where(mask_indices, sampled_prob, -float('inf'))
+            for j in range(B):
+                k = min(unmasking_num, int(mask_indices[j].sum().item()))
+                if k > 0:
+                    _, sel = torch.topk(score[j], k=k)
+                    xt[j, sel] = sampled[j, sel]
+        else:
+            # standard top-k per batch
+            for j in range(B):
+                k = min(unmasking_num, int(mask_indices[j].sum().item())) # number of tokens to unmask
+                if k > 0:
+                    _, select_indices = torch.topk(unmasking_score[j], k=k)
+                    xt[j, select_indices] = torch.argmax(logits_with_noise[j, select_indices], dim = -1)
+
+        if return_stats:
+            new_mask = (xt == mask_id)
+            _stat_tokens += int(mask_indices.sum().item()) - int(new_mask.sum().item())
+
         if track:
             cur = torch.cat([xt_t1, xt], dim=1) if arm_init else xt
             track_xt.append(cur.clone().detach().cpu())
     if arm_init:
         xt = torch.cat([xt_t1, xt], dim=1)
+    if return_stats:
+        stats = {"total_tokens": _stat_tokens, "total_active_steps": _stat_active_steps}
+        return (xt, track_xt) if track else xt, stats
     if track:
         return xt, track_xt
     else:

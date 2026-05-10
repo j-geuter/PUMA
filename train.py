@@ -104,7 +104,7 @@ def mdm_loss(model, input_ids, mask_id: int, prompt_mask: Optional[torch.Tensor]
         loss = papl_token_weights[mask_indices] * nll[mask_indices] / num_mask[mask_indices]
     elif arm_init:
         ce = F.cross_entropy(logits[:, :-1, :][mask_indices[:, 1:]], input_ids[:, 1:][mask_indices[:, 1:]], reduction="none")
-        loss = ce / num_mask[mask_indices[:, 1:]]
+        loss = ce / num_mask[mask_indices]
     else:
         ce = F.cross_entropy(logits[mask_indices], input_ids[mask_indices], reduction="none")
         loss = ce / num_mask[mask_indices]
@@ -189,7 +189,7 @@ def val_loss_ddp(model, val_loader, mask_id: int, device, rank: int, world_size:
 
                 if arm_init:
                     ce = F.cross_entropy(logits[:, :-1, :][mask_indices[:, 1:]], x0[:, 1:][mask_indices[:, 1:]], reduction="none")
-                    loss = (ce / num_mask_exp[mask_indices[:, 1:]]).sum() / B
+                    loss = (ce / num_mask_exp[mask_indices]).sum() / B
                 else:
                     ce = F.cross_entropy(logits[mask_indices], x0[mask_indices], reduction="none")
                     loss = (ce / num_mask_exp[mask_indices]).sum() / B
@@ -255,6 +255,77 @@ def parse_k_schedule_increasing(k_schedule) -> List[Tuple[int, int]]:
 
 
 
+@torch.no_grad()
+def compute_unmask_order(model, x0, mask_id, prompt_mask, unmasking_num=2, confidence="top_k", arm_init=False, micro_batch_size=8):
+    """
+    Compute unmasking order by progressively revealing GT tokens in order of
+    model confidence.  Returns (B, L) int32 numpy array where each value is
+    the trajectory step at which that position was unmasked (0 = prompt).
+    Processes samples in micro-batches to avoid OOM.
+    """
+    B = x0.shape[0]
+    results = []
+    for start in range(0, B, micro_batch_size):
+        end = min(start + micro_batch_size, B)
+        x0_chunk = x0[start:end]
+        pm_chunk = prompt_mask[start:end]
+        results.append(_compute_unmask_order_chunk(model, x0_chunk, mask_id, pm_chunk, unmasking_num, confidence, arm_init))
+    return np.concatenate(results, axis=0)
+
+
+@torch.no_grad()
+def _compute_unmask_order_chunk(model, x0, mask_id, prompt_mask, unmasking_num=2, confidence="top_k", arm_init=False):
+    B, L = x0.shape
+    device = x0.device
+
+    xt = x0.clone()
+    xt[~prompt_mask] = mask_id
+
+    max_step = (L // max(unmasking_num, 1)) + 2
+    unmask_order = torch.zeros((B, L), dtype=torch.int32, device=device)
+    unmask_order[~prompt_mask] = max_step
+
+    if arm_init:
+        xt_t1 = xt[:, :1].clone()
+        xt_work, x0_work = xt[:, 1:].clone(), x0[:, 1:]
+        L_work = L - 1
+    else:
+        xt_work, x0_work = xt, x0
+        L_work = L
+
+    step = 0
+    for _ in range(L_work // max(unmasking_num, 1) + 1):
+        mask_idx = (xt_work == mask_id)
+        if mask_idx.sum() == 0:
+            break
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+            inp = torch.cat([xt_t1, xt_work], dim=1) if arm_init else xt_work
+            logits = model(inp)
+        if arm_init:
+            logits = logits[:, :-1, :]
+
+        p = F.softmax(logits, dim=-1)
+        if confidence == "top_k":
+            score = torch.where(mask_idx, p.max(dim=-1).values, -float('inf'))
+        elif confidence == "top_k_margin":
+            top2 = p.topk(k=2, dim=-1).values
+            score = torch.where(mask_idx, top2[..., 0] - top2[..., 1], -float('inf'))
+        else:
+            score = torch.where(mask_idx, p.max(dim=-1).values, -float('inf'))
+
+        step += 1
+        for b in range(B):
+            k = min(unmasking_num, int(mask_idx[b].sum().item()))
+            if k > 0:
+                _, sel = torch.topk(score[b], k=k)
+                xt_work[b, sel] = x0_work[b, sel]
+                offset = 1 if arm_init else 0
+                unmask_order[b, sel + offset] = step
+
+    return unmask_order.cpu().numpy()
+
+
 def main(cfg: DictConfig, args):
     # setup the DDP
     rank, world_size, local_rank = setup_ddp()
@@ -271,7 +342,7 @@ def main(cfg: DictConfig, args):
     torch.cuda.manual_seed(seed)
 
     # ckpt dir
-    ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"ckpts/date={datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}")
+    ckpt_dir = f"/n/netscratch/dam_lab/Lab/jgeuter/MDMPre/ckpts/date={datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
     os.makedirs(ckpt_dir, exist_ok=True)
     if is_main:
         print(f"Checkpoints will be saved to: {ckpt_dir}")
@@ -343,8 +414,11 @@ def main(cfg: DictConfig, args):
         train_sampler = None
 
     # optimizer and scheduler
+    max_steps = getattr(train_cfg, 'max_steps', None)
     optimizer = optim.AdamW(model.parameters(), lr=train_cfg.learning_rate, weight_decay=train_cfg.weight_decay)
     num_training_steps = train_cfg.num_epochs * len(train_loader)
+    if max_steps is not None:
+        num_training_steps = min(num_training_steps, max_steps)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=train_cfg.warmup_steps, num_training_steps=num_training_steps)
     if train_cfg.ema is not None:
         assert 0.0 < train_cfg.ema < 1.0, "EMA decay must be between 0 and 1"
@@ -355,6 +429,9 @@ def main(cfg: DictConfig, args):
             print("EMA is enabled with decay:", train_cfg.ema)
 
     strategy = train_cfg.strategy
+    puma_warmup_steps = 0  # default; overridden below for progressive strategy
+    warmup_iter = None
+
     # k schedule for progressive unmasking. If None use fixed K. If "linear", linearly increase the unmasking steps from 1 to K over the training steps.
     # If a list of integers, use the list as the k_steps. If an integer, use constant interval increase.
     if strategy == "progressive":
@@ -380,8 +457,23 @@ def main(cfg: DictConfig, args):
                 mode=train_cfg.mode,
                 confidence_threshold=train_cfg.confidence_threshold,
                 eos_id=train_cfg.eos_id,
+                random_unmask_prob=getattr(train_cfg, 'random_unmask_prob', 0.0),
+                prompt_only_reset=getattr(cfg.data, 'single_seq_sudoku', False),
             )
-        pool = make_pool(current_k)
+
+        # warmup: use vanilla MDM training before switching to progressive
+        puma_warmup_ratio = getattr(train_cfg, 'puma_warmup_ratio', 0.0)
+        puma_warmup_steps = int(puma_warmup_ratio * num_training_steps)
+        warmup_iter = None
+
+        if puma_warmup_steps == 0:
+            pool = make_pool(current_k)
+        else:
+            pool = None  # will be created after warmup
+            warmup_iter = iter(train_loader)
+            if is_main:
+                print(f"PUMA warmup: {puma_warmup_steps} steps of vanilla MDM training before switching to progressive")
+
         next_k_idx = 1
 
 
@@ -392,9 +484,60 @@ def main(cfg: DictConfig, args):
     # wandb initialize
     if cfg.wandb.wandb and is_main:
         run_name = cfg.wandb.name
-        if args.seed is not None:
-            run_name = f"{run_name}_seed{args.seed}"
         wandb.init(project=cfg.wandb.project, name=run_name, entity=cfg.wandb.entity)
+
+    # --- trajectory logging setup ---
+    traj_log_steps = getattr(train_cfg, 'traj_log_steps', 0)
+    traj_log_data = None
+    traj_save_path = None
+    traj_x0 = None
+    traj_pm = None
+
+    if traj_log_steps > 0 and is_main:
+        traj_num_samples = getattr(train_cfg, 'traj_num_samples', 100)
+        if cfg.data.dataset == "sudoku":
+            val_dir = cfg.validation.val_dir
+            test_file = os.path.join(val_dir, "test_mdm.npy")
+            raw = np.load(test_file)[:traj_num_samples]
+            traj_x0 = torch.from_numpy(raw).long().to(device)
+            traj_pm = torch.zeros(traj_x0.shape, dtype=torch.bool, device=device)
+            traj_pm[:, :81] = True
+        else:
+            ds = data_bundle.val_loader.dataset
+            n_traj = min(traj_num_samples, len(ds))
+            samples = [ds[i] for i in range(n_traj)]
+            traj_x0 = torch.stack([s["labels"] for s in samples]).to(device)
+            traj_pm = torch.stack([s["prompt_mask"] for s in samples]).bool().to(device)
+
+        traj_log_data = {
+            "mask_id": int(mask_id),
+            "dataset": cfg.data.dataset,
+            "prompt_masks": traj_pm.cpu().numpy(),
+            "unmask_orders": {},
+        }
+        traj_save_path = os.path.join(ckpt_dir, "traj_log.npy")
+        print(f"Trajectory logging: {traj_x0.shape[0]} samples, every {traj_log_steps} steps")
+        print(f"Saving to: {traj_save_path}")
+
+        # log step 0 (initial model)
+        model.eval()
+        m = model.module if isinstance(model, DDP) else model
+        order_0 = compute_unmask_order(m, traj_x0, mask_id, traj_pm,
+                                       arm_init=model_config.predict_next_token)
+        traj_log_data["unmask_orders"][0] = order_0
+        np.save(traj_save_path, traj_log_data)
+        print("Trajectory logged at step 0")
+        model.train()
+
+    # save step-0 checkpoint (before any training)
+    if is_main:
+        if train_cfg.ema is not None:
+            saved_path = save_ema_snapshot(ckpt_dir, model, ema, cfg, 0, 0, None, None)
+            if saved_path is not None:
+                print(f"Step-0 EMA snapshot saved to: {saved_path}")
+        saved_path = save_model_snapshot(ckpt_dir, model, cfg, 0, 0, val_loss=None)
+        if saved_path is not None:
+            print(f"Step-0 model saved to: {saved_path}")
 
     for epoch in range(train_cfg.num_epochs):
         model.train()
@@ -403,7 +546,10 @@ def main(cfg: DictConfig, args):
             train_sampler.set_epoch(epoch)
 
         if strategy == "progressive":
-            pool.reset_loader_iter()
+            if pool is not None:
+                pool.reset_loader_iter()
+            if warmup_iter is not None and global_step < puma_warmup_steps:
+                warmup_iter = iter(train_loader)
             steps_per_epoch = len(train_loader)
             iterable = range(steps_per_epoch)
         elif strategy == "standard" or strategy == "arm":
@@ -415,8 +561,8 @@ def main(cfg: DictConfig, args):
             pbar = iterable
 
         for itr in pbar:
-            # update current K if using k schedule
-            if strategy == "progressive" and next_k_idx < len(k_schedule) and global_step == k_schedule[next_k_idx][1]:
+            # update current K if using k schedule (skip during warmup)
+            if strategy == "progressive" and global_step >= puma_warmup_steps and next_k_idx < len(k_schedule) and global_step == k_schedule[next_k_idx][1]:
                 current_k = k_schedule[next_k_idx][0]
                 if is_main:
                     print(f"[K-SWITCH] Step {global_step}: K={current_k}")
@@ -427,7 +573,21 @@ def main(cfg: DictConfig, args):
 
             # to enable flashattention, we do the autocast
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled = torch.cuda.is_available()):
-                if strategy == "progressive":
+                if strategy == "progressive" and global_step < puma_warmup_steps:
+                    # vanilla MDM training during warmup
+                    try:
+                        batch = next(warmup_iter)
+                    except StopIteration:
+                        warmup_iter = iter(train_loader)
+                        batch = next(warmup_iter)
+                    input_ids = batch["labels"].to(device)
+                    prompt_mask = batch["prompt_mask"].to(device) if "prompt_mask" in batch else None
+                    loss = mdm_loss(model, input_ids, mask_id, prompt_mask=prompt_mask, arm_init=model_config.predict_next_token, papl_alpha=papl_alpha, papl_tau=papl_tau)
+                elif strategy == "progressive":
+                    if pool is None:
+                        pool = make_pool(current_k)
+                        if is_main:
+                            print(f"[WARMUP->PUMA] Switching to progressive at step {global_step}")
                     xt = pool.current_batch()
                     logits = model(xt)
                     log_probs = F.log_softmax(logits, dim=-1)
@@ -457,7 +617,7 @@ def main(cfg: DictConfig, args):
             global_step += 1
             
             # update a new seq
-            if strategy == "progressive":
+            if strategy == "progressive" and global_step > puma_warmup_steps and pool is not None:
                 pool.update_with_logits(log_probs)
 
             if is_main:
@@ -476,6 +636,15 @@ def main(cfg: DictConfig, args):
 
             if global_step % train_cfg.eval_steps == 0:
                 model.eval()
+
+                # trajectory logging
+                if traj_log_data is not None and global_step % traj_log_steps == 0:
+                    m = model.module if isinstance(model, DDP) else model
+                    order = compute_unmask_order(m, traj_x0, mask_id, traj_pm,
+                                                arm_init=model_config.predict_next_token)
+                    traj_log_data["unmask_orders"][global_step] = order
+                    np.save(traj_save_path, traj_log_data)
+                    print(f"Trajectory logged at step {global_step}")
 
                 # validaton on the downstream task; disabled when we use EMA
                 if train_cfg.ema is None:
@@ -531,7 +700,36 @@ def main(cfg: DictConfig, args):
                             print(f"Model saved to: {saved_path}")
                 
                 model.train()
-    
+
+            if max_steps is not None and global_step >= max_steps:
+                if is_main:
+                    print(f"Reached max_steps={max_steps}, stopping.")
+                break
+
+        # break out of epoch loop too
+        if max_steps is not None and global_step >= max_steps:
+            break
+
+    # final trajectory log
+    if traj_log_data is not None and global_step not in traj_log_data["unmask_orders"]:
+        model.eval()
+        m = model.module if isinstance(model, DDP) else model
+        order = compute_unmask_order(m, traj_x0, mask_id, traj_pm,
+                                    arm_init=model_config.predict_next_token)
+        traj_log_data["unmask_orders"][global_step] = order
+        np.save(traj_save_path, traj_log_data)
+        print(f"Final trajectory logged at step {global_step}")
+
+    # final checkpoint if last step wasn't a save point
+    if is_main and global_step % train_cfg.save_steps != 0:
+        if train_cfg.ema is not None:
+            saved_path = save_ema_snapshot(ckpt_dir, model, ema, cfg, epoch, global_step, None, None)
+            if saved_path is not None:
+                print(f"Final EMA snapshot saved to: {saved_path}")
+        saved_path = save_model_snapshot(ckpt_dir, model, cfg, epoch, global_step, val_loss=None)
+        if saved_path is not None:
+            print(f"Final model saved to: {saved_path}")
+
     if cfg.wandb.wandb and is_main:
         wandb.finish()
     

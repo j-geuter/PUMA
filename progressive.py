@@ -100,7 +100,7 @@ class PhasedMasking:
         * if a seq goes through all stages, we refill it with a new sequence from the train loader
     """
 
-    def __init__(self, train_loader: DataLoader, batch_size: int, mask_id: int, K: int, device: torch.device, L: int, mode: str = "standard", confidence_threshold: Optional[float] = None, eos_id: Optional[int] = None):
+    def __init__(self, train_loader: DataLoader, batch_size: int, mask_id: int, K: int, device: torch.device, L: int, mode: str = "standard", confidence_threshold: Optional[float] = None, eos_id: Optional[int] = None, random_unmask_prob: float = 0.0, prompt_only_reset: bool = False):
         self.train_loader = train_loader
         self.batch_size = batch_size
         self.mask_id = mask_id
@@ -110,6 +110,8 @@ class PhasedMasking:
         self.mode = mode
         self.eos_id = eos_id
         self.confidence_threshold = confidence_threshold
+        self.random_unmask_prob = random_unmask_prob
+        self.prompt_only_reset = prompt_only_reset
         assert mode in ["standard" , "confidence_collapse"], "invalid/deprecated mode"
 
         # build intervals
@@ -278,6 +280,10 @@ class PhasedMasking:
         xt = self.xt
         if k_max > 0:
             score_conf = torch.where(mask_idx , log_probs.max(dim = 2)[0], torch.finfo(log_probs.dtype).min) # [B, L]
+            if self.random_unmask_prob > 0:
+                use_random = (torch.rand(B, L, device=device) < self.random_unmask_prob) & mask_idx
+                random_scores = torch.where(mask_idx, torch.rand(B, L, device=device), torch.finfo(score_conf.dtype).min)
+                score_conf = torch.where(use_random, random_scores, score_conf)
             xt = unmask_from_scores(score_conf, to_reveal, self.x0, self.xt)
 
         if self.mode in ["confidence_collapse"]:
@@ -299,6 +305,9 @@ class PhasedMasking:
             idx = replace.nonzero(as_tuple = False).squeeze(1) # [n_new]
             stages = torch.zeros(n_new, device=device, dtype=torch.long)
             new_x0, new_xt, new_masks, new_L_eff = self._refill_pool(n_new, stages)
+            if self.prompt_only_reset:
+                new_xt = torch.full_like(new_x0, self.mask_id)
+                new_xt = torch.where(new_masks, new_x0, new_xt)
             self.x0[idx] = new_x0
             self.xt[idx] = new_xt
             self.state['prompt_mask'][idx] = new_masks
